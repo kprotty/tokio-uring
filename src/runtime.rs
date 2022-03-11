@@ -1,4 +1,4 @@
-use crate::driver::Driver;
+use crate::driver::{Driver, CURRENT};
 
 use std::future::Future;
 use std::io;
@@ -51,6 +51,11 @@ pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHand
 impl Runtime {
     pub(crate) fn new() -> io::Result<Runtime> {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .on_thread_park(|| {
+                CURRENT.with(|x| {
+                    let _ = x.borrow_mut().flush_submissions();
+                });
+            })
             .enable_all()
             .build()?;
 
@@ -73,7 +78,7 @@ impl Runtime {
                 loop {
                     // Wait for read-readiness
                     let mut guard = self.driver.readable().await.unwrap();
-                    self.driver.get_ref().tick();
+                    self.driver.get_ref().flush_completions();
                     guard.clear_ready();
                 }
             };

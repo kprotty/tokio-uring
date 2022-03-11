@@ -30,13 +30,14 @@ mod util;
 
 mod write;
 
-use io_uring::{cqueue, IoUring};
+use io_uring::{cqueue, squeue, IoUring};
 use scoped_tls::scoped_thread_local;
 use slab::Slab;
 use std::cell::RefCell;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
+use std::collections::VecDeque;
 
 pub(crate) struct Driver {
     inner: Handle,
@@ -44,19 +45,22 @@ pub(crate) struct Driver {
 
 type Handle = Rc<RefCell<Inner>>;
 
-struct Inner {
+pub(crate) struct Inner {
     /// In-flight operations
     ops: Ops,
 
     /// IoUring bindings
     uring: IoUring,
+
+    /// Queue of stuff to submit
+    submissions: VecDeque<squeue::Entry>,
 }
 
 // When dropping the driver, all in-flight operations must have completed. This
 // type wraps the slab and ensures that, on drop, the slab is empty.
 struct Ops(Slab<op::Lifecycle>);
 
-scoped_thread_local!(static CURRENT: Rc<RefCell<Inner>>);
+scoped_thread_local!(pub(crate) static CURRENT: Rc<RefCell<Inner>>);
 
 impl Driver {
     pub(crate) fn new() -> io::Result<Driver> {
@@ -65,6 +69,7 @@ impl Driver {
         let inner = Rc::new(RefCell::new(Inner {
             ops: Ops::new(),
             uring,
+            submissions: VecDeque::new(),
         }));
 
         Ok(Driver { inner })
@@ -75,9 +80,8 @@ impl Driver {
         CURRENT.set(&self.inner, || f())
     }
 
-    pub(crate) fn tick(&self) {
-        let mut inner = self.inner.borrow_mut();
-        inner.tick();
+    pub(crate) fn flush_completions(&self) -> usize {
+        self.inner.borrow_mut().flush_completions()
     }
 
     fn wait(&self) -> io::Result<usize> {
@@ -94,11 +98,14 @@ impl Driver {
 }
 
 impl Inner {
-    fn tick(&mut self) {
+    pub(crate) fn flush_completions(&mut self) -> usize {
         let mut cq = self.uring.completion();
         cq.sync();
 
+        let mut flushed = 0;
         for cqe in cq {
+            flushed += 1;
+
             if cqe.user_data() == u64::MAX {
                 // Result of the cancellation action. There isn't anything we
                 // need to do here. We must wait for the CQE for the operation
@@ -110,23 +117,45 @@ impl Inner {
 
             self.ops.complete(index, resultify(&cqe), cqe.flags());
         }
+
+        flushed
     }
 
-    fn submit(&mut self) -> io::Result<()> {
-        loop {
-            match self.uring.submit() {
-                Ok(_) => {
-                    self.uring.submission().sync();
-                    return Ok(());
+    pub(crate) fn flush_submissions(&mut self) -> io::Result<()> {
+        while !self.submissions.is_empty() {
+            {
+                let mut sq = self.uring.submission();
+
+                while let Some(sqe) = self.submissions.pop_front() {
+                    if unsafe { sq.push(&sqe).is_err() } {
+                        // If the sq is full, put the sqe back for later
+                        // and break out of the loop to submit the existing ones to free up space
+                        self.submissions.push_front(sqe);
+                        break;
+                    }
                 }
-                Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.tick();
-                }
-                Err(e) => {
-                    return Err(e);
+            }
+
+            loop {
+                match self.uring.submit() {
+                    Ok(_) => {
+                        self.uring.submission().sync();
+                        break;
+                    }
+                    Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                        match self.flush_completions() {
+                            0 => return Ok(()), // if no completions, bail and wait on epoll
+                            _ => break, // if there were completions, retry flushing submissions
+                        }
+                    },
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -142,7 +171,7 @@ impl Drop for Driver {
             // If waiting fails, ignore the error. The wait will be attempted
             // again on the next loop.
             let _ = self.wait().unwrap();
-            self.tick();
+            self.inner.borrow_mut().flush_completions();
         }
     }
 }

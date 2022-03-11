@@ -68,32 +68,15 @@ impl<T> Op<T> {
             let mut inner_ref = inner_rc.borrow_mut();
             let inner = &mut *inner_ref;
 
-            // If the submission queue is full, flush it to the kernel
-            if inner.uring.submission().is_full() {
-                inner.submit()?;
-            }
-
             // Create the operation
             let mut op = Op::new(data, inner, inner_rc);
 
             // Configure the SQE
             let sqe = f(op.data.as_mut().unwrap()).user_data(op.index as _);
+            
+            // Enqueue the sqe for submission
+            inner.submissions.push_back(sqe);
 
-            {
-                let mut sq = inner.uring.submission();
-
-                // Push the new operation
-                if unsafe { sq.push(&sqe).is_err() } {
-                    unimplemented!("when is this hit?");
-                }
-            }
-
-            // Submit the new operation. At this point, the operation has been
-            // pushed onto the queue and the tail pointer has been updated, so
-            // the submission entry is visible to the kernel. If there is an
-            // error here (probably EAGAIN), we still return the operation. A
-            // future `io_uring_enter` will fully submit the event.
-            let _ = inner.submit();
             Ok(op)
         })
     }
